@@ -1,206 +1,86 @@
-# Databricks notebook source
-from pyspark.sql import functions as F
-from pyspark.sql.window import Window
-
-
-CATALOG = "sagar_cat_project1"
-SILVER_SCHEMA = f"{CATALOG}.silver"
-GOLD_SCHEMA = f"{CATALOG}.gold"
-BASE_TABLE = f"{SILVER_SCHEMA}.iot_cleaned"
-
-# Create the Gold schema if it doesn't exist
-spark.sql(f"CREATE SCHEMA IF NOT EXISTS {GOLD_SCHEMA}")
-
-# Load the base Silver table
-base_df = spark.table(BASE_TABLE)
-
-
-
-# Standardize column names to ensure consistency
-# (Handles cases like 'sales_amount' vs 'SalesAmount' and 'StoreID_norm' vs 'StoreID')
-if "sales_amount" in base_df.columns and "SalesAmount" not in base_df.columns:
-    base_df = base_df.withColumnRenamed("sales_amount", "SalesAmount")
-if "StoreID_norm" in base_df.columns and "StoreID" not in base_df.columns:
-    base_df = base_df.withColumnRenamed("StoreID_norm", "StoreID")
-
-# Ensure correct data types for calculations
-base_df = (base_df
-           .withColumn("OrderTime", F.to_timestamp("OrderTime"))
-           .withColumn("SalesAmount", F.col("SalesAmount").cast("double"))
-           .withColumn("Quantity", F.col("Quantity").cast("int"))
-          )
-
-# Derive common date and month grains for aggregation
-base_df = (base_df
-           .withColumn("order_date", F.to_date("OrderTime"))
-           .withColumn("order_month", F.date_trunc("month", "OrderTime"))
-          )
-
-# -----------------------------
-# KPI: Daily and Monthly Sales per Region
-# -----------------------------
-print("Creating sales KPIs per region...")
-
-# Daily aggregation
-daily_sales = (base_df
-    .groupBy("order_date", "Region")
-    .agg(
-        F.sum("SalesAmount").alias("total_sales"),
-        F.sum("Quantity").alias("total_units_sold"),
-        F.countDistinct("OrderID").alias("distinct_orders")
+from dlt import table, read
+import pyspark.sql.functions as F
+# ===============================
+# Gold Layer Tables (capstone_retail.gold)
+# ===============================
+# 1. Daily / Monthly Sales per Region
+@table(
+    name="shibang.capstone_retail_shibang.gold_sales_region",
+    comment="Daily & Monthly Sales per Region"
+)
+def gold_sales_region():
+    return (
+        read("shibang.capstone_retail_shibang.silver_orders")
+        .withColumn("OrderDate", F.to_date("OrderTime", "M/d/yyyy H:mm"))
+        .withColumn("YearMonth", F.date_format("OrderDate", "yyyy-MM"))
+        .groupBy("Region", "OrderDate", "YearMonth")
+        .agg(F.sum("SalesAmount").alias("TotalSales"))
     )
+# 2. Device Anomaly Trend per Store
+@table(
+    name="shibang.capstone_retail_shibang.gold_anomaly_trends",
+    comment="Device Anomaly Trend per Store"
 )
-(daily_sales.write.format("delta").mode("overwrite")
- .saveAsTable(f"{GOLD_SCHEMA}.daily_sales_by_region"))
-
-# Monthly aggregation
-monthly_sales = (base_df
-    .groupBy("order_month", "Region")
-    .agg(
-        F.sum("SalesAmount").alias("total_sales"),
-        F.sum("Quantity").alias("total_units_sold"),
-        F.countDistinct("OrderID").alias("distinct_orders")
+def gold_anomaly_trends():
+    return (
+        read("shibang.capstone_retail_shibang.silver_orders")
+        .withColumn("OrderDate", F.to_date("OrderTime", "M/d/yyyy H:mm"))
+        .groupBy("StoreID", "OrderDate", "DeviceType", "AnomalyType")
+        .agg(F.count("*").alias("AnomalyCount"))
     )
+# 3. Conversion Rate Impact when devices fail
+@table(
+    name="shibang.capstone_retail_shibang.gold_conversion_impact",
+    comment="Conversion rate impact of device failures"
 )
-(monthly_sales.write.format("delta").mode("overwrite")
- .saveAsTable(f"{GOLD_SCHEMA}.monthly_sales_by_region"))
-
-# -----------------------------
-# KPI: Device Anomaly Trend per Store
-# -----------------------------
-print("Creating device anomaly trend KPI...")
-
-anomaly_trend = (base_df
-    .groupBy("order_date", "StoreID")
-    .agg(
-        F.sum("AnomalyFlag_Sales").alias("anomaly_count"),
-        F.count("OrderID").alias("total_transactions")
+def gold_conversion_impact():
+    df = read("shibang.capstone_retail_shibang.silver_orders")
+    total_orders = df.groupBy("StoreID").agg(F.count("*").alias("TotalOrders"))
+    failed_orders = (
+        df.filter(df.AnomalyFlag == 1)
+        .groupBy("StoreID")
+        .agg(F.count("*").alias("FailedOrders"))
     )
-    .withColumn("anomaly_rate", F.col("anomaly_count") / F.col("total_transactions"))
-)
-(anomaly_trend.write.format("delta").mode("overwrite")
- .saveAsTable(f"{GOLD_SCHEMA}.daily_anomaly_trend_by_store"))
-
-# -----------------------------
-# KPI: Conversion Rate Impact from Device Failures
-# -----------------------------
-print("Creating conversion rate impact KPI...")
-
-# We define "conversion" as the ratio of successful orders to total orders at a store-day level
-daily_impact = (base_df
-    .groupBy("order_date", "StoreID")
-    .agg(
-        F.sum(F.when(F.col("AnomalyFlag_Sales") == 1, 1).otherwise(0)).alias("anomaly_orders"),
-        F.count("OrderID").alias("total_orders")
+    return (
+        total_orders.join(failed_orders, "StoreID", "left")
+        .withColumn("FailedOrders", F.coalesce(F.col("FailedOrders"), F.lit(0)))
+        .withColumn("FailureRate", F.col("FailedOrders") / F.col("TotalOrders"))
     )
-    .withColumn("successful_orders", F.col("total_orders") - F.col("anomaly_orders"))
-    .withColumn("success_rate", F.col("successful_orders") / F.col("total_orders"))
-    .withColumn("had_anomaly_day", F.when(F.col("anomaly_orders") > 0, 1).otherwise(0))
+# 4. Store Tier Classification
+@table(
+    name="shibang.capstone_retail_shibang.gold_store_tiers",
+    comment="Store tiers based on total sales (High / Medium / Low performers)"
 )
-(daily_impact.write.format("delta").mode("overwrite")
- .saveAsTable(f"{GOLD_SCHEMA}.daily_conversion_impact_by_store"))
-
-# -----------------------------
-# Enrichment: Tag Stores into Performance Tiers
-# -----------------------------
-print("Enriching stores with performance tiers...")
-
-# Calculate total sales per store for each month
-store_monthly_sales = base_df.groupBy("order_month", "StoreID").agg(F.sum("SalesAmount").alias("total_sales"))
-
-# Use a window function to rank stores within each month
-w_spec = Window.partitionBy("order_month").orderBy(F.col("total_sales").desc())
-store_ranks = store_monthly_sales.withColumn("rank", F.percent_rank().over(w_spec))
-
-# Assign tiers based on percentile rank
-store_tiers = store_ranks.withColumn("performance_tier",
-    F.when(F.col("rank") <= 0.2, "High")
-     .when((F.col("rank") > 0.2) & (F.col("rank") <= 0.8), "Medium")
-     .otherwise("Low")
-)
-(store_tiers.select("order_month", "StoreID", "total_sales", "performance_tier")
- .write.format("delta").mode("overwrite")
- .saveAsTable(f"{GOLD_SCHEMA}.monthly_store_performance_tiers"))
-
-# -----------------------------
-# Enrichment: Compute Weighted Sales vs. Anomalies Score
-# -----------------------------
-print("Enriching stores with a weighted performance score...")
-
-# Get monthly sales and anomaly counts per store
-monthly_kpis = base_df.groupBy("order_month", "StoreID").agg(
-    F.sum("SalesAmount").alias("sales"),
-    F.sum("AnomalyFlag_Sales").alias("anomalies")
-)
-
-# Define a window to normalize scores across all stores within a month
-w_monthly = Window.partitionBy("order_month")
-
-# Calculate min-max normalized scores for sales and anomalies
-normalized_kpis = (monthly_kpis
-    .withColumn("max_sales", F.max("sales").over(w_monthly))
-    .withColumn("min_sales", F.min("sales").over(w_monthly))
-    .withColumn("max_anomalies", F.max("anomalies").over(w_monthly))
-    .withColumn("min_anomalies", F.min("anomalies").over(w_monthly))
-    .withColumn("sales_norm",
-        F.when(F.col("max_sales") == F.col("min_sales"), 1.0)
-         .otherwise((F.col("sales") - F.col("min_sales")) / (F.col("max_sales") - F.col("min_sales")))
+def gold_store_tiers():
+    df = (
+        read("shibang.capstone_retail_shibang.silver_orders")
+        .groupBy("StoreID")
+        .agg(F.sum("SalesAmount").alias("TotalSales"))
     )
-    .withColumn("anomalies_norm",
-        F.when(F.col("max_anomalies") == F.col("min_anomalies"), 0.0)
-         .otherwise((F.col("anomalies") - F.col("min_anomalies")) / (F.col("max_anomalies") - F.col("min_anomalies")))
+    return (
+        df.withColumn(
+            "StoreTier",
+            F.when(F.col("TotalSales") > 100000, "High")
+            .when(F.col("TotalSales") > 50000, "Medium")
+            .otherwise("Low")
+        )
     )
+# 5. Weighted Average Sales vs Anomalies
+@table(
+    name="shibang.capstone_retail_shibang.gold_weighted_sales_anomalies",
+    comment="Weighted average of sales vs anomalies per store"
 )
-
-# Compute the final weighted score (e.g., 80% weight for sales, 20% for anomalies)
-weighted_score = normalized_kpis.withColumn(
-    "performance_score",
-    (0.8 * F.col("sales_norm")) - (0.2 * F.col("anomalies_norm"))
-)
-
-(weighted_score.select("order_month", "StoreID", "sales", "anomalies", "performance_score")
- .write.format("delta").mode("overwrite")
- .saveAsTable(f"{GOLD_SCHEMA}.monthly_store_weighted_score"))
-
-print("\n--- Gold Layer Generation Complete ---")
-
-# COMMAND ----------
-
-
-CATALOG = "sagar_cat_project1"
-GOLD_SCHEMA = f"{CATALOG}.gold"
-
-# List of all the Gold tables created
-gold_tables = [
-    "daily_sales_by_region",
-    "monthly_sales_by_region",
-    "daily_anomaly_trend_by_store",
-    "daily_conversion_impact_by_store",
-    "monthly_store_performance_tiers",
-    "monthly_store_weighted_score"
-]
-
-for table_name in gold_tables:
-    full_table_name = f"{GOLD_SCHEMA}.{table_name}"
-    print(f"--- Displaying contents of: {full_table_name} ---")
-    
-
-    display(spark.table(full_table_name).head(5))
-
-# COMMAND ----------
-
-
-CATALOG = "sagar_cat_project1"
-SILVER_SCHEMA = f"{CATALOG}.silver"
-
-
-silver_tables = [
-    "iot_cleaned",
-    "iot_cleaned_partitionbyregion",
-    "iot_cleaned_zorder"
-]
-
-for table_name in silver_tables:
-    full_table_name = f"{SILVER_SCHEMA}.{table_name}"
-    print(f"--- Displaying top 5 rows of: {full_table_name} ---")
-    display(spark.table(full_table_name).limit(10))
+def gold_weighted_sales_anomalies():
+    df = read("shibang.capstone_retail_shibang.silver_orders")
+    return (
+        df.groupBy("StoreID")
+        .agg(
+            F.sum("SalesAmount").alias("TotalSales"),
+            F.sum(F.when(F.col("AnomalyFlag") == 1, 1).otherwise(0)).alias("TotalAnomalies")
+        )
+        .withColumn(
+            "SalesPerAnomaly",
+            F.when(F.col("TotalAnomalies") > 0, F.col("TotalSales") / F.col("TotalAnomalies"))
+            .otherwise(F.lit(None))
+        )
+    )
